@@ -7,18 +7,18 @@
 DOCUMENTATION = r"""
 ---
 module: lightsail_disk
-version_added: 9.2.0
-short_description: Manage Disks in AWS Lightsail
+version_added: 10.0.0
+short_description: Manage AWS Lightsail Disks
 description:
-  - Manage Disks in AWS Lightsail.
+  - Manage AWS Lightsail Disks
 author:
-  - "Fabricio Lopez (@fabriciolopez)"
+  - "Fabricio Lopez (fabricio.lopez@gmail.com)"
 options:
   state:
     description:
       - Describes the desired state.
     default: present
-    choices: ['present', 'absent']
+    choices: ['present', 'absent', 'attached', 'detached']
     type: str
   name:
     description: Name of the Disk.
@@ -88,9 +88,9 @@ from ansible_collections.community.aws.plugins.module_utils.modules import (
 )
 
 
-def find_disk_info(module, client, disk_name, fail_if_not_found=False):
+def find_disk_info(module, client, name, fail_if_not_found=False):
     try:
-        res = client.get_disk(diskName=disk_name)
+        res = client.get_disk(diskName=name)
     except is_boto3_error_code("NotFoundException") as e:
         if fail_if_not_found:
             module.fail_json_aws(e)
@@ -100,13 +100,25 @@ def find_disk_info(module, client, disk_name, fail_if_not_found=False):
     return res["disk"]
 
 
-def create_disk(module, client, disk_name, zone):
-    inst = find_disk_info(module, client, disk_name)
+def check_disk_state(module, client, name, fail_if_not_found=False):
+    try:
+        res = client.get_disk(diskName=name)
+    except is_boto3_error_code("NotFoundException") as e:
+        if fail_if_not_found:
+            module.fail_json_aws(e)
+        return None
+    except botocore.exceptions.ClientError as e:  # pylint: disable=duplicate-except
+        module.fail_json_aws(e)
+    return res["disk"]["state"]
+
+
+def create_disk(module, client, name, zone):
+    inst = find_disk_info(module, client, name)
     if inst:
         module.exit_json(changed=False, disk=camel_dict_to_snake_dict(inst))
     else:
         create_params = {
-            "diskName": disk_name,
+            "diskName": name,
             "sizeInGb": 8,
             "availabilityZone": zone,
         }
@@ -116,19 +128,60 @@ def create_disk(module, client, disk_name, zone):
         except botocore.exceptions.ClientError as e:
             module.fail_json_aws(e)
 
-        inst = find_disk_info(module, client, disk_name, fail_if_not_found=True)
+        inst = find_disk_info(module, client, name, fail_if_not_found=True)
 
         module.exit_json(changed=True, disk=camel_dict_to_snake_dict(inst))
 
 
-def delete_disk(module, client, disk_name):
-    inst = find_disk_info(module, client, disk_name)
+def attach_disk(module, client, name, instance_name, disk_path):
+    inst = find_disk_info(module, client, name)
+    check = check_disk_state(module, client, name)
+    if not inst or check == "in-use":
+        module.exit_json(changed=False, disk=camel_dict_to_snake_dict(inst))
+    else:
+        attach_params = {
+            "diskName": name,
+            "instanceName": instance_name,
+            "diskPath": disk_path,
+        }
+
+        try:
+            client.attach_disk(**attach_params)
+        except botocore.exceptions.ClientError as e:
+            module.fail_json_aws(e)
+
+        inst = find_disk_info(module, client, name, fail_if_not_found=True)
+
+        module.exit_json(changed=True, disk=camel_dict_to_snake_dict(inst))
+
+
+def detach_disk(module, client, name):
+    inst = find_disk_info(module, client, name)
+    if not inst:
+        module.exit_json(changed=False, disk=camel_dict_to_snake_dict(inst))
+    else:
+        detach_params = {
+            "diskName": name,
+        }
+
+        try:
+            client.detach_disk(**detach_params)
+        except botocore.exceptions.ClientError as e:
+            module.fail_json_aws(e)
+
+        inst = find_disk_info(module, client, name, fail_if_not_found=True)
+
+        module.exit_json(changed=True, disk=camel_dict_to_snake_dict(inst))
+
+
+def delete_disk(module, client, name):
+    inst = find_disk_info(module, client, name)
     if inst is None:
         module.exit_json(changed=False, disk={})
 
     changed = False
     try:
-        client.delete_disk(diskName=disk_name)
+        client.delete_disk(diskName=name)
         changed = True
     except botocore.exceptions.ClientError as e:
         module.fail_json_aws(e)
@@ -138,23 +191,31 @@ def delete_disk(module, client, disk_name):
 
 def main():
     argument_spec = dict(
+        zone=dict(type="str", required=False),
+        instance_name=dict(type="str", required=False),
         name=dict(type="str", required=True),
-        zone=dict(type="str", required=True),
-        state=dict(type="str", default="present", choices=["present", "absent"]),
+        disk_path=dict(type="str", required=False),
+        state=dict(type="str", default="present", choices=["present", "absent", "attached", "detached"]),
     )
 
     module = AnsibleAWSModule(argument_spec=argument_spec)
 
     client = module.client("lightsail")
 
-    name = module.params.get("name")
     state = module.params.get("state")
     zone = module.params.get("zone")
+    name = module.params.get("name")
+    instance_name = module.params.get("instance_name")
+    disk_path = module.params.get("disk_path")
 
     if state == "present":
         create_disk(module, client, name, zone)
     elif state == "absent":
         delete_disk(module, client, name)
+    elif state == "attached":
+        attach_disk(module, client, name, instance_name, disk_path)
+    elif state == "detached":
+        detach_disk(module, client, name)
 
 
 if __name__ == "__main__":
